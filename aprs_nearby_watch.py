@@ -34,9 +34,10 @@ RADIUS_KM = 100
 WINDOW_MINUTES = 15
 SERVER_FILTER = f"r/{CENTER_LAT:.5f}/{CENTER_LON:.5f}/{RADIUS_KM}"
 
-# 断线重连：缩短重连间隔；长时间无数据则强制断开并重连
-RECONNECT_DELAY_SECONDS = 5
-AIS_STALE_SECONDS = 120
+# 断线重连：仅在长时间无 APRS-IS 数据时强制重连，避免过于激进
+RECONNECT_DELAY_SECONDS = 15
+AIS_STALE_SECONDS = 600
+WATCHDOG_INTERVAL_SECONDS = 60
 
 
 def utc_now():
@@ -116,18 +117,7 @@ def prune_old_records(reports):
         del reports[src]
 
 
-def ais_link_unreliable(connection_state, now=None):
-    """APRS-IS 链路不可信时，不应把台站判为 down。"""
-    now = now or utc_now()
-    if not connection_state.get("connected"):
-        return True
-    last_activity = connection_state.get("last_activity")
-    if last_activity and (now - last_activity).total_seconds() > AIS_STALE_SECONDS:
-        return True
-    return False
-
-
-def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_from, target_url, connection_state):
+def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_from, target_url):
     """对单个目标：根据最近是否在 window_minutes 内有上报，向 Kuma 推送 up/down。"""
     if not target_url or not target_from:
         return
@@ -143,8 +133,6 @@ def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_f
             status = "down"
             msg = "no position in window" if not report else f"last {report['seen'].strftime('%H:%M:%S')} UTC"
             ping = None
-    if status == "down" and ais_link_unreliable(connection_state, now):
-        return
     params = {"status": status, "msg": msg}
     if ping is not None:
         params["ping"] = f"{ping:.1f}"
@@ -169,7 +157,7 @@ def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_f
         push_state[target_from]["last_error"] = None if ok else msg
 
 
-def kuma_push_loop(reports, reports_lock, push_state, connection_state):
+def kuma_push_loop(reports, reports_lock, push_state):
     """后台线程：每 PUSH_INTERVAL_SECONDS 秒对全部监控目标各 Push 一次。"""
     while True:
         time.sleep(PUSH_INTERVAL_SECONDS)
@@ -178,14 +166,14 @@ def kuma_push_loop(reports, reports_lock, push_state, connection_state):
             target_url = t.get("url", "")
             do_kuma_push_one(
                 reports, reports_lock, push_state, WINDOW_MINUTES,
-                target_from, target_url, connection_state,
+                target_from, target_url,
             )
 
 
 def ais_watchdog(ais_ref, connection_state):
     """长时间无 APRS-IS 数据时强制断开，触发重连。"""
     while True:
-        time.sleep(30)
+        time.sleep(WATCHDOG_INTERVAL_SECONDS)
         if not connection_state.get("connected"):
             continue
         last_activity = connection_state.get("last_activity")
@@ -198,7 +186,6 @@ def ais_watchdog(ais_ref, connection_state):
             f"APRS-IS 超过 {AIS_STALE_SECONDS}s 无数据，强制重连..."
         )
         connection_state["connected"] = False
-        connection_state["last_disconnect"] = utc_now()
         ais = ais_ref[0]
         if ais is not None:
             try:
@@ -214,6 +201,7 @@ def main():
     print("输出模式: 实时刷新（每条有效报文刷新一次）")
     print("检测范围:", f"{RADIUS_KM}km")
     print("时间窗口:", f"{WINDOW_MINUTES}分钟")
+    print("看门狗超时:", f"{AIS_STALE_SECONDS}s")
     if KUMA_TARGETS:
         print("Kuma Push: 已启用，每", PUSH_INTERVAL_SECONDS, "秒上报，监控目标:", [t.get("from") for t in KUMA_TARGETS])
     else:
@@ -223,13 +211,13 @@ def main():
     reports = {}
     reports_lock = threading.Lock()
     push_state = {t.get("from", ""): {"last_ok": None, "last_time": None, "target_status": "unknown", "last_error": None} for t in KUMA_TARGETS}
-    connection_state = {"connected": False, "last_activity": None, "last_disconnect": None}
+    connection_state = {"connected": False, "last_activity": None}
     ais_ref = [None]
 
     if KUMA_TARGETS:
         push_thread = threading.Thread(
             target=kuma_push_loop,
-            args=(reports, reports_lock, push_state, connection_state),
+            args=(reports, reports_lock, push_state),
             daemon=True,
         )
         push_thread.start()
@@ -290,7 +278,6 @@ def main():
             )
         finally:
             connection_state["connected"] = False
-            connection_state["last_disconnect"] = utc_now()
             ais_ref[0] = None
             try:
                 ais.close()
