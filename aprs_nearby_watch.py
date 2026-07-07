@@ -17,6 +17,8 @@ except ImportError:
     KUMA_TARGETS = []
     PUSH_INTERVAL_SECONDS = 300
 
+KUMA_FROM_SET = {t.get("from", "") for t in KUMA_TARGETS if t.get("from")}
+
 
 # =========================
 # 配置
@@ -31,7 +33,7 @@ CENTER_LAT = 26 + 2.97 / 60
 CENTER_LON = 119 + 20.58 / 60
 
 RADIUS_KM = 100
-WINDOW_MINUTES = 15
+WINDOW_MINUTES = 30
 SERVER_FILTER = f"r/{CENTER_LAT:.5f}/{CENTER_LON:.5f}/{RADIUS_KM}"
 
 # 断线重连：仅在长时间无 APRS-IS 数据时强制重连，避免过于激进
@@ -57,7 +59,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return r * c
 
 
-def print_result(reports, push_state=None):
+def print_result(reports, push_state=None, kuma_last_heard=None):
     # 仅在交互式终端时清屏；systemd 服务下保留输出供 journalctl 查看
     if os.isatty(1):
         os.system("cls" if os.name == "nt" else "clear")
@@ -85,7 +87,13 @@ def print_result(reports, push_state=None):
             target_status = state.get("target_status")
             if target_status is None:
                 report = reports.get(target_from)
-                target_status = "up" if report and report["seen"] >= cutoff else "down"
+                last_heard = (kuma_last_heard or {}).get(target_from)
+                if last_heard and last_heard >= cutoff:
+                    target_status = "up"
+                elif report and report["seen"] >= cutoff:
+                    target_status = "up"
+                else:
+                    target_status = "down"
             last_ok = state.get("last_ok")
             last_time = state.get("last_time")
             last_err = state.get("last_error")
@@ -112,26 +120,39 @@ def print_result(reports, push_state=None):
 
 def prune_old_records(reports):
     cutoff = utc_now() - timedelta(minutes=WINDOW_MINUTES)
-    expired = [src for src, report in reports.items() if report["seen"] < cutoff]
+    expired = [
+        src for src, report in reports.items()
+        if report["seen"] < cutoff and src not in KUMA_FROM_SET
+    ]
     for src in expired:
         del reports[src]
 
 
-def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_from, target_url):
-    """对单个目标：根据最近是否在 window_minutes 内有上报，向 Kuma 推送 up/down。"""
+def do_kuma_push_one(reports, reports_lock, push_state, kuma_last_heard, window_minutes, target_from, target_url):
+    """对单个目标：根据最近是否在 window_minutes 内有上报（含遥测包），向 Kuma 推送 up/down。"""
     if not target_url or not target_from:
         return
     now = utc_now()
     cutoff = now - timedelta(minutes=window_minutes)
     with reports_lock:
         report = reports.get(target_from)
-        if report and report["seen"] >= cutoff:
+        last_heard = kuma_last_heard.get(target_from)
+        if last_heard and last_heard >= cutoff:
             status = "up"
-            msg = f"last seen {report['seen'].strftime('%H:%M:%S')} UTC, dist {report['dist']:.1f}km"
-            ping = report.get("dist")
+            if report and report["seen"] >= cutoff:
+                msg = f"last seen {report['seen'].strftime('%H:%M:%S')} UTC, dist {report['dist']:.1f}km"
+                ping = report.get("dist")
+            else:
+                msg = f"last heard {last_heard.strftime('%H:%M:%S')} UTC"
+                ping = None
         else:
             status = "down"
-            msg = "no position in window" if not report else f"last {report['seen'].strftime('%H:%M:%S')} UTC"
+            if last_heard:
+                msg = f"last heard {last_heard.strftime('%H:%M:%S')} UTC"
+            elif report:
+                msg = f"last seen {report['seen'].strftime('%H:%M:%S')} UTC"
+            else:
+                msg = "no packets yet"
             ping = None
     params = {"status": status, "msg": msg}
     if ping is not None:
@@ -157,7 +178,7 @@ def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_f
         push_state[target_from]["last_error"] = None if ok else msg
 
 
-def kuma_push_loop(reports, reports_lock, push_state):
+def kuma_push_loop(reports, reports_lock, push_state, kuma_last_heard):
     """后台线程：每 PUSH_INTERVAL_SECONDS 秒对全部监控目标各 Push 一次。"""
     while True:
         time.sleep(PUSH_INTERVAL_SECONDS)
@@ -165,7 +186,7 @@ def kuma_push_loop(reports, reports_lock, push_state):
             target_from = t.get("from", "")
             target_url = t.get("url", "")
             do_kuma_push_one(
-                reports, reports_lock, push_state, WINDOW_MINUTES,
+                reports, reports_lock, push_state, kuma_last_heard, WINDOW_MINUTES,
                 target_from, target_url,
             )
 
@@ -209,6 +230,7 @@ def main():
     print("按 Ctrl+C 退出")
 
     reports = {}
+    kuma_last_heard = {}
     reports_lock = threading.Lock()
     push_state = {t.get("from", ""): {"last_ok": None, "last_time": None, "target_status": "unknown", "last_error": None} for t in KUMA_TARGETS}
     connection_state = {"connected": False, "last_activity": None}
@@ -217,7 +239,7 @@ def main():
     if KUMA_TARGETS:
         push_thread = threading.Thread(
             target=kuma_push_loop,
-            args=(reports, reports_lock, push_state),
+            args=(reports, reports_lock, push_state, kuma_last_heard),
             daemon=True,
         )
         push_thread.start()
@@ -232,9 +254,13 @@ def main():
     def on_packet(packet):
         connection_state["last_activity"] = utc_now()
 
+        src = packet.get("from")
+        if src and src in KUMA_FROM_SET:
+            with reports_lock:
+                kuma_last_heard[src] = utc_now()
+
         lat = packet.get("latitude")
         lon = packet.get("longitude")
-        src = packet.get("from")
         if lat is None or lon is None or not src:
             return
 
@@ -255,7 +281,8 @@ def main():
             prune_old_records(reports)
             reports_snapshot = dict(reports)
             push_snapshot = dict(push_state)
-        print_result(reports_snapshot, push_snapshot)
+            heard_snapshot = dict(kuma_last_heard)
+        print_result(reports_snapshot, push_snapshot, heard_snapshot)
 
     while True:
         ais = aprslib.IS(CALLSIGN, passwd=PASSCODE, host=HOST, port=PORT)
