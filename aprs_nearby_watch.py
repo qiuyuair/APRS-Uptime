@@ -34,6 +34,10 @@ RADIUS_KM = 100
 WINDOW_MINUTES = 15
 SERVER_FILTER = f"r/{CENTER_LAT:.5f}/{CENTER_LON:.5f}/{RADIUS_KM}"
 
+# 断线重连：缩短重连间隔；长时间无数据则强制断开并重连
+RECONNECT_DELAY_SECONDS = 5
+AIS_STALE_SECONDS = 120
+
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -112,7 +116,18 @@ def prune_old_records(reports):
         del reports[src]
 
 
-def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_from, target_url):
+def ais_link_unreliable(connection_state, now=None):
+    """APRS-IS 链路不可信时，不应把台站判为 down。"""
+    now = now or utc_now()
+    if not connection_state.get("connected"):
+        return True
+    last_activity = connection_state.get("last_activity")
+    if last_activity and (now - last_activity).total_seconds() > AIS_STALE_SECONDS:
+        return True
+    return False
+
+
+def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_from, target_url, connection_state):
     """对单个目标：根据最近是否在 window_minutes 内有上报，向 Kuma 推送 up/down。"""
     if not target_url or not target_from:
         return
@@ -128,6 +143,8 @@ def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_f
             status = "down"
             msg = "no position in window" if not report else f"last {report['seen'].strftime('%H:%M:%S')} UTC"
             ping = None
+    if status == "down" and ais_link_unreliable(connection_state, now):
+        return
     params = {"status": status, "msg": msg}
     if ping is not None:
         params["ping"] = f"{ping:.1f}"
@@ -152,7 +169,7 @@ def do_kuma_push_one(reports, reports_lock, push_state, window_minutes, target_f
         push_state[target_from]["last_error"] = None if ok else msg
 
 
-def kuma_push_loop(reports, reports_lock, push_state):
+def kuma_push_loop(reports, reports_lock, push_state, connection_state):
     """后台线程：每 PUSH_INTERVAL_SECONDS 秒对全部监控目标各 Push 一次。"""
     while True:
         time.sleep(PUSH_INTERVAL_SECONDS)
@@ -161,8 +178,33 @@ def kuma_push_loop(reports, reports_lock, push_state):
             target_url = t.get("url", "")
             do_kuma_push_one(
                 reports, reports_lock, push_state, WINDOW_MINUTES,
-                target_from, target_url,
+                target_from, target_url, connection_state,
             )
+
+
+def ais_watchdog(ais_ref, connection_state):
+    """长时间无 APRS-IS 数据时强制断开，触发重连。"""
+    while True:
+        time.sleep(30)
+        if not connection_state.get("connected"):
+            continue
+        last_activity = connection_state.get("last_activity")
+        if not last_activity:
+            continue
+        if (utc_now() - last_activity).total_seconds() <= AIS_STALE_SECONDS:
+            continue
+        print(
+            f"[{utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}] "
+            f"APRS-IS 超过 {AIS_STALE_SECONDS}s 无数据，强制重连..."
+        )
+        connection_state["connected"] = False
+        connection_state["last_disconnect"] = utc_now()
+        ais = ais_ref[0]
+        if ais is not None:
+            try:
+                ais.close()
+            except Exception:
+                pass
 
 
 def main():
@@ -181,22 +223,27 @@ def main():
     reports = {}
     reports_lock = threading.Lock()
     push_state = {t.get("from", ""): {"last_ok": None, "last_time": None, "target_status": "unknown", "last_error": None} for t in KUMA_TARGETS}
+    connection_state = {"connected": False, "last_activity": None, "last_disconnect": None}
+    ais_ref = [None]
 
     if KUMA_TARGETS:
         push_thread = threading.Thread(
             target=kuma_push_loop,
-            args=(reports, reports_lock, push_state),
+            args=(reports, reports_lock, push_state, connection_state),
             daemon=True,
         )
         push_thread.start()
 
-    ais = aprslib.IS(CALLSIGN, passwd=PASSCODE, host=HOST, port=PORT)
-    ais.connect()
-    ais.set_filter(SERVER_FILTER)
-    print("已建立持续连接，开始实时接收...")
+    watchdog_thread = threading.Thread(
+        target=ais_watchdog,
+        args=(ais_ref, connection_state),
+        daemon=True,
+    )
+    watchdog_thread.start()
 
-    # 在回调中进行距离判断，并按完整 from（含 SSID）保留最新一条
     def on_packet(packet):
+        connection_state["last_activity"] = utc_now()
+
         lat = packet.get("latitude")
         lon = packet.get("longitude")
         src = packet.get("from")
@@ -222,13 +269,36 @@ def main():
             push_snapshot = dict(push_state)
         print_result(reports_snapshot, push_snapshot)
 
-    try:
-        ais.consumer(on_packet, raw=False)
-    finally:
+    while True:
+        ais = aprslib.IS(CALLSIGN, passwd=PASSCODE, host=HOST, port=PORT)
+        ais_ref[0] = ais
         try:
-            ais.close()
-        except Exception:
-            pass
+            connection_state["connected"] = False
+            ais.connect(blocking=True, retry=RECONNECT_DELAY_SECONDS)
+            ais.set_filter(SERVER_FILTER)
+            connection_state["connected"] = True
+            connection_state["last_activity"] = utc_now()
+            print("已建立持续连接，开始实时接收...")
+
+            ais.consumer(on_packet, raw=False, blocking=True)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(
+                f"[{utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}] "
+                f"APRS-IS 连接中断: {e}"
+            )
+        finally:
+            connection_state["connected"] = False
+            connection_state["last_disconnect"] = utc_now()
+            ais_ref[0] = None
+            try:
+                ais.close()
+            except Exception:
+                pass
+
+        print(f"{RECONNECT_DELAY_SECONDS}s 后重连...")
+        time.sleep(RECONNECT_DELAY_SECONDS)
 
 
 if __name__ == "__main__":
