@@ -3,6 +3,8 @@
 
 import math
 import os
+import select
+import socket
 import threading
 import time
 import urllib.parse
@@ -10,6 +12,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import aprslib
+from aprslib.exceptions import ConnectionDrop, ParseError, UnknownFormat
 
 try:
     from kuma_push_config import KUMA_TARGETS, PUSH_INTERVAL_SECONDS
@@ -34,10 +37,12 @@ RADIUS_KM = 100
 WINDOW_MINUTES = 40
 SERVER_FILTER = f"r/{CENTER_LAT:.5f}/{CENTER_LON:.5f}/{RADIUS_KM}"
 
-# 断线重连：仅在长时间无 APRS-IS 数据时强制重连，避免过于激进
+# 断线重连：10 分钟无位置包则强制重连
 RECONNECT_DELAY_SECONDS = 15
 AIS_STALE_SECONDS = 600
 WATCHDOG_INTERVAL_SECONDS = 60
+# select 超时：避免 aprslib 无限阻塞；超时本身不算断线
+SELECT_TIMEOUT_SECONDS = 30
 
 
 def utc_now():
@@ -170,8 +175,24 @@ def kuma_push_loop(reports, reports_lock, push_state):
             )
 
 
+def force_close_ais(ais):
+    """尽量让阻塞中的 select/recv 立刻退出。"""
+    if ais is None:
+        return
+    sock = getattr(ais, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+    try:
+        ais.close()
+    except Exception:
+        pass
+
+
 def ais_watchdog(ais_ref, connection_state):
-    """长时间无 APRS-IS 数据时强制断开，触发重连。"""
+    """长时间无位置包时强制断开，触发重连。"""
     while True:
         time.sleep(WATCHDOG_INTERVAL_SECONDS)
         if not connection_state.get("connected"):
@@ -183,15 +204,60 @@ def ais_watchdog(ais_ref, connection_state):
             continue
         print(
             f"[{utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}] "
-            f"APRS-IS 超过 {AIS_STALE_SECONDS}s 无数据，强制重连..."
+            f"APRS-IS 超过 {AIS_STALE_SECONDS}s 无位置包，强制重连..."
         )
         connection_state["connected"] = False
-        ais = ais_ref[0]
-        if ais is not None:
+        force_close_ais(ais_ref[0])
+
+
+def consume_ais_stream(ais, on_packet, connection_state):
+    """
+    替代 aprslib.consumer 的阻塞读取：
+    - select 带超时，避免永久卡住
+    - 看门狗关闭套接字后能干净退出
+    """
+    buf = b""
+    try:
+        ais.sock.setblocking(False)
+    except socket.error as e:
+        raise ConnectionDrop(f"connection dropped: {e}")
+
+    while connection_state.get("connected"):
+        try:
+            ready, _, _ = select.select([ais.sock], [], [], SELECT_TIMEOUT_SECONDS)
+        except (ValueError, OSError, socket.error) as e:
+            raise ConnectionDrop(f"select failed: {e}")
+
+        if not ready:
+            continue
+
+        try:
+            chunk = ais.sock.recv(4096)
+        except BlockingIOError:
+            continue
+        except socket.error as e:
+            raise ConnectionDrop(f"recv failed: {e}")
+
+        if not chunk:
+            raise ConnectionDrop("connection dropped")
+
+        buf += chunk
+
+        while b"\r\n" in buf:
+            line, buf = buf.split(b"\r\n", 1)
+            if not line:
+                continue
+            if line.startswith(b"#"):
+                continue
             try:
-                ais.close()
+                packet = aprslib.parse(line)
+            except (ParseError, UnknownFormat):
+                continue
             except Exception:
-                pass
+                continue
+            on_packet(packet)
+
+    raise ConnectionDrop("watchdog closed connection")
 
 
 def main():
@@ -201,7 +267,7 @@ def main():
     print("输出模式: 实时刷新（每条有效报文刷新一次）")
     print("检测范围:", f"{RADIUS_KM}km")
     print("时间窗口:", f"{WINDOW_MINUTES}分钟")
-    print("看门狗超时:", f"{AIS_STALE_SECONDS}s")
+    print("看门狗超时:", f"{AIS_STALE_SECONDS}s（按位置包计）")
     if KUMA_TARGETS:
         print("Kuma Push: 已启用，每", PUSH_INTERVAL_SECONDS, "秒上报，监控目标:", [t.get("from") for t in KUMA_TARGETS])
     else:
@@ -230,13 +296,14 @@ def main():
     watchdog_thread.start()
 
     def on_packet(packet):
-        connection_state["last_activity"] = utc_now()
-
         lat = packet.get("latitude")
         lon = packet.get("longitude")
         src = packet.get("from")
         if lat is None or lon is None or not src:
             return
+
+        # 位置包：刷新看门狗计时（不论是否进入监控列表）
+        connection_state["last_activity"] = utc_now()
 
         lat = float(lat)
         lon = float(lon)
@@ -268,7 +335,7 @@ def main():
             connection_state["last_activity"] = utc_now()
             print("已建立持续连接，开始实时接收...")
 
-            ais.consumer(on_packet, raw=False, blocking=True)
+            consume_ais_stream(ais, on_packet, connection_state)
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -278,11 +345,8 @@ def main():
             )
         finally:
             connection_state["connected"] = False
+            force_close_ais(ais)
             ais_ref[0] = None
-            try:
-                ais.close()
-            except Exception:
-                pass
 
         print(f"{RECONNECT_DELAY_SECONDS}s 后重连...")
         time.sleep(RECONNECT_DELAY_SECONDS)
