@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/APRS_Uptime
+WorkingDirectory=/home/ubuntu/APRS-Uptime
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/ubuntu/APRS_Uptime/.venv/bin/python /home/ubuntu/APRS_Uptime/aprs_nearby_watch.py
+ExecStart=/home/ubuntu/APRS-Uptime/.venv/bin/python /home/ubuntu/APRS-Uptime/aprs_nearby_watch.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
