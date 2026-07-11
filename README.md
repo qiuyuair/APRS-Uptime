@@ -51,9 +51,9 @@ source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
 
-# 必填：呼号、坐标等本地配置
-cp watch_config.example.py watch_config.py
-nano watch_config.py
+# 必填：从示例复制主程序，再改呼号、坐标等
+cp aprs_nearby_watch.example.py aprs_nearby_watch.py
+nano aprs_nearby_watch.py
 
 # 可选：Uptime Kuma Push
 cp kuma_push_config.example.py kuma_push_config.py
@@ -71,13 +71,13 @@ python aprs_nearby_watch.py
 
 ## 配置
 
-### 1. 监听参数（必填）
+### 1. 主程序（必填）
 
 ```bash
-cp watch_config.example.py watch_config.py
+cp aprs_nearby_watch.example.py aprs_nearby_watch.py
 ```
 
-编辑 `watch_config.py`：
+编辑 `aprs_nearby_watch.py` 顶部配置区：
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
@@ -92,7 +92,7 @@ cp watch_config.example.py watch_config.py
 | `WATCHDOG_INTERVAL_SECONDS` | 看门狗检查间隔（秒） | `60` |
 | `SELECT_TIMEOUT_SECONDS` | 接收循环 select 超时（秒） | `30` |
 
-`watch_config.py` 含个人呼号与坐标，**已加入 `.gitignore`，请勿提交**。
+`aprs_nearby_watch.py` 含个人呼号与坐标，**已加入 `.gitignore`，请勿提交**。仓库中只保留无个人信息的 `aprs_nearby_watch.example.py`。
 
 ### 2. Uptime Kuma Push（可选）
 
@@ -151,6 +151,7 @@ sudo systemctl enable --now aprs-uptime
 ```bash
 cd ~/APRS-Uptime
 git pull
+# 如有逻辑更新，把 example 里的改动合并进你的本地 aprs_nearby_watch.py
 source .venv/bin/activate
 pip install -r requirements.txt
 sudo systemctl restart aprs-uptime
@@ -168,9 +169,8 @@ journalctl -u aprs-uptime -f
 
 | 文件 | 说明 |
 |------|------|
-| `aprs_nearby_watch.py` | 主程序 |
-| `watch_config.py` | 本地监听配置（**不纳入版本控制**） |
-| `watch_config.example.py` | 监听配置示例，复制后修改 |
+| `aprs_nearby_watch.example.py` | 主程序示例（仓库跟踪） |
+| `aprs_nearby_watch.py` | 本地主程序（**不纳入版本控制**） |
 | `kuma_push_config.py` | Kuma Push 本地配置（**不纳入版本控制**） |
 | `kuma_push_config.example.py` | Kuma 配置示例，复制后修改 |
 | `aprs-uptime.service` | systemd 服务单元示例 |
@@ -180,7 +180,7 @@ journalctl -u aprs-uptime -f
 
 以下文件含个人或敏感信息，已加入 `.gitignore`，请勿提交到公开仓库：
 
-- `watch_config.py`（呼号、坐标等）
+- `aprs_nearby_watch.py`（呼号、坐标等）
 - `kuma_push_config.py`（Uptime Kuma Push token）
 
 ## 许可证

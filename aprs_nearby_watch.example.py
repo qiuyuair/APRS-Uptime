@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+APRS Nearby Watch 示例。
+复制为 aprs_nearby_watch.py 后，再修改下方呼号、坐标等本地配置。
+
+  cp aprs_nearby_watch.example.py aprs_nearby_watch.py
+"""
 
 import math
 import os
@@ -20,29 +26,29 @@ except ImportError:
     KUMA_TARGETS = []
     PUSH_INTERVAL_SECONDS = 300
 
-try:
-    from watch_config import (
-        AIS_STALE_SECONDS,
-        CALLSIGN,
-        CENTER_LAT,
-        CENTER_LON,
-        HOST,
-        PASSCODE,
-        PORT,
-        RADIUS_KM,
-        RECONNECT_DELAY_SECONDS,
-        SELECT_TIMEOUT_SECONDS,
-        WATCHDOG_INTERVAL_SECONDS,
-        WINDOW_MINUTES,
-    )
-except ImportError as e:
-    raise SystemExit(
-        "缺少 watch_config.py。请先执行：\n"
-        "  cp watch_config.example.py watch_config.py\n"
-        "然后编辑 watch_config.py 填入呼号、坐标等信息。"
-    ) from e
 
+# =========================
+# 配置（请修改为你的本地信息）
+# =========================
+CALLSIGN = "N0CALL-17"
+PASSCODE = "-1"
+HOST = "rotate.aprs2.net"
+PORT = 14580
+
+# 监控中心点（十进制度）
+CENTER_LAT = 0.0
+CENTER_LON = 0.0
+
+RADIUS_KM = 100
+WINDOW_MINUTES = 40
 SERVER_FILTER = f"r/{CENTER_LAT:.5f}/{CENTER_LON:.5f}/{RADIUS_KM}"
+
+# 断线重连：10 分钟无位置包则强制重连
+RECONNECT_DELAY_SECONDS = 15
+AIS_STALE_SECONDS = 600
+WATCHDOG_INTERVAL_SECONDS = 60
+# select 超时：避免 aprslib 无限阻塞；超时本身不算断线
+SELECT_TIMEOUT_SECONDS = 30
 
 
 def utc_now():
